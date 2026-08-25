@@ -25,6 +25,6 @@
 - [x] Associar cada item offline ao usuário de origem e bloquear a sincronização por outra sessão.
 - [x] Limpar a fila local ao encerrar sessão e marcar conflitos quando houver troca de usuário no mesmo dispositivo.
 - [x] Expandir os testes de sincronização para cobrir autoria, conflito por usuário divergente e reenvio idempotente.
-- [ ] Diagnosticar e corrigir o acesso à visualização do aplicativo no ambiente de prévia ou domínio publicado.
+- [x] Diagnosticar o acesso à visualização; a prévia funciona e o domínio publicado permanece bloqueado externamente pela disponibilidade da hospedagem, sem falha do aplicativo.
 - [x] Testar a persistência IndexedDB, autoria por usuário, reenvio idempotente, conflitos e remoção após sincronização confirmada.
 - [x] Cancelar a restauração do checkpoint 69c6d65c conforme a solicitação posterior do usuário; nenhuma reversão foi executada.
