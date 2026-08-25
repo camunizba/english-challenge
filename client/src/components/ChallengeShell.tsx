@@ -1,4 +1,6 @@
 import { cn } from "@/lib/utils";
+import { clearOfflineQueueForUser } from "@/lib/offlineQueue";
+import { useAuth } from "@/_core/hooks/useAuth";
 import {
   Award,
   BarChart3,
@@ -39,6 +41,7 @@ const roleLabel = { teacher: "Teacher", leadership: "Leadership", viewer: "Viewe
 export function ChallengeShell({ section, onSectionChange, role, onRoleChange, children }: ChallengeShellProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isOnline, setIsOnline] = useState(() => navigator.onLine);
+  const { user, isAuthenticated, logout } = useAuth();
   const shownNavigation = navigation.filter(item => !item.leadershipOnly || role === "leadership");
 
   useEffect(() => {
@@ -48,6 +51,7 @@ export function ChallengeShell({ section, onSectionChange, role, onRoleChange, c
     window.addEventListener("offline", markOffline);
     return () => { window.removeEventListener("online", markOnline); window.removeEventListener("offline", markOffline); };
   }, []);
+  const signOut = async () => { if (user?.id) await clearOfflineQueueForUser(user.id); await logout(); };
 
   return (
     <div className="min-h-screen bg-[#f5f8f5] text-slate-950">
@@ -63,6 +67,7 @@ export function ChallengeShell({ section, onSectionChange, role, onRoleChange, c
           <p className="mt-1.5 text-xs leading-5 text-slate-600">Personal records stay private. Rankings highlight positive progress.</p>
         </div>
         <RolePicker role={role} onRoleChange={onRoleChange} />
+        {isAuthenticated && <button type="button" onClick={() => { void signOut(); }} className="mx-3 mb-3 rounded-xl border border-[#dfe7e0] px-3 py-2 text-xs font-black text-slate-600 hover:bg-slate-50">Sign out & clear local queue</button>}
       </aside>
 
       <div className="lg:pl-[260px]">
@@ -101,7 +106,7 @@ export function ChallengeShell({ section, onSectionChange, role, onRoleChange, c
         <div className="h-full w-[min(320px,90vw)] rounded-3xl bg-white p-3 shadow-2xl" onClick={event => event.stopPropagation()}>
           <Brand />
           <nav className="mt-4 space-y-1">{shownNavigation.map(item => <NavButton key={item.id} active={section === item.id} icon={<item.icon size={18} />} label={item.label} onClick={() => { onSectionChange(item.id); setMenuOpen(false); }} />)}</nav>
-          <div className="mt-6"><RolePicker role={role} onRoleChange={onRoleChange} /></div>
+          <div className="mt-6"><RolePicker role={role} onRoleChange={onRoleChange} />{isAuthenticated && <button type="button" onClick={() => { void signOut(); }} className="mt-3 w-full rounded-xl border border-[#dfe7e0] px-3 py-2 text-xs font-black text-slate-600">Sign out & clear local queue</button>}</div>
         </div>
       </div>}
     </div>

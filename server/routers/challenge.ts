@@ -11,6 +11,7 @@ import {
   getMyStudentStatement,
   getStudentStatement,
   getCurrentRule,
+  getEntriesByBatchIdempotencyKey,
   listReferenceData,
   importStudents,
   searchActiveStudents,
@@ -28,6 +29,8 @@ const activityInput = z.object({
   note: z.string().max(500).optional(),
   confirmedPortugueseOccurrence: z.boolean().default(false),
   idempotencyKey: z.string().min(12).max(100),
+  sourceDeviceId: z.string().min(8).max(96).optional(),
+  originalRecordedAt: z.coerce.date().optional(),
 });
 
 function requireStaff(role: string) {
@@ -36,46 +39,61 @@ function requireStaff(role: string) {
   }
 }
 
+async function persistActivity({ ctx, input }: { ctx: { user: { id: number; role: string } }; input: z.infer<typeof activityInput> }) {
+  requireStaff(ctx.user.role);
+  if (input.action === "Portuguese Occurrence" && !input.confirmedPortugueseOccurrence) {
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Portuguese Occurrence requires confirmation." });
+  }
+  if (input.originalRecordedAt && input.originalRecordedAt.getTime() > Date.now() + 5 * 60 * 1000) {
+    throw new TRPCError({ code: "BAD_REQUEST", message: "The original activity time cannot be in the future." });
+  }
+  const existing = await getEntriesByBatchIdempotencyKey(input.idempotencyKey);
+  if (existing.length) return { created: 0, entryIds: existing.map(entry => entry.id), alreadySynced: true, undoExpiresAt: new Date() };
+  if (ctx.user.role === "teacher") {
+    const assigned = await teacherCanRecord(ctx.user.id, input.classId, input.subjectId);
+    if (!assigned) throw new TRPCError({ code: "FORBIDDEN", message: "This class and subject are not assigned to this teacher." });
+  }
+  const rule = await getCurrentRule(input.action as ChallengeAction);
+  const cooldownSeconds = rule?.cooldownSeconds ?? 15;
+  for (const studentId of input.studentIds) {
+    const duplicate = await findRecentDuplicate({ userId: ctx.user.id, studentId, subjectId: input.subjectId, action: input.action as ChallengeAction, cooldownSeconds });
+    if (duplicate) throw new TRPCError({ code: "CONFLICT", message: "A recent matching entry is still inside the cooldown window." });
+  }
+  return createActivityEntries({
+    userId: ctx.user.id,
+    studentIds: input.studentIds,
+    classId: input.classId,
+    subjectId: input.subjectId,
+    cycleId: input.cycleId,
+    action: input.action as ChallengeAction,
+    points: Number(rule?.points ?? actionDefaults[input.action as ChallengeAction]),
+    note: input.note,
+    idempotencyKey: input.idempotencyKey,
+    undoWindowSeconds: 8,
+    recordedAt: input.originalRecordedAt,
+    sourceDeviceId: input.sourceDeviceId,
+  });
+}
+
 export const challengeRouter = router({
   snapshot: protectedProcedure.query(() => getChallengeSnapshot()),
   references: protectedProcedure.query(() => listReferenceData()),
   searchStudents: protectedProcedure.input(z.object({ query: z.string().max(80), classId: z.number().int().positive().optional() }))
     .query(({ input }) => searchActiveStudents(input.query, input.classId)),
-  record: protectedProcedure.input(activityInput).mutation(async ({ ctx, input }) => {
-    requireStaff(ctx.user.role);
-    if (input.action === "Portuguese Occurrence" && !input.confirmedPortugueseOccurrence) {
-      throw new TRPCError({ code: "BAD_REQUEST", message: "Portuguese Occurrence requires confirmation." });
-    }
-    if (ctx.user.role === "teacher") {
-      const assigned = await teacherCanRecord(ctx.user.id, input.classId, input.subjectId);
-      if (!assigned) throw new TRPCError({ code: "FORBIDDEN", message: "This class and subject are not assigned to this teacher." });
-    }
-    const rule = await getCurrentRule(input.action as ChallengeAction);
-    const cooldownSeconds = rule?.cooldownSeconds ?? 15;
-    for (const studentId of input.studentIds) {
-      const duplicate = await findRecentDuplicate({
-        userId: ctx.user.id,
-        studentId,
-        subjectId: input.subjectId,
-        action: input.action as ChallengeAction,
-        cooldownSeconds,
-      });
-      if (duplicate) {
-        throw new TRPCError({ code: "CONFLICT", message: "A recent matching entry is still inside the cooldown window." });
+  record: protectedProcedure.input(activityInput).mutation(({ ctx, input }) => persistActivity({ ctx, input })),
+  syncOffline: protectedProcedure.input(z.object({ items: z.array(activityInput.extend({ queueId: z.string().min(8).max(128), originUserId: z.number().int().positive() })).min(1).max(100) })).mutation(async ({ ctx, input }) => {
+    const results: Array<{ queueId: string; status: "synced" | "conflict"; entryIds?: number[]; message?: string }> = [];
+    for (const item of input.items) {
+      const { queueId, originUserId, ...activity } = item;
+      try {
+        if (originUserId !== ctx.user.id) throw new TRPCError({ code: "CONFLICT", message: "This offline activity belongs to a different signed-in user." });
+        const result = await persistActivity({ ctx, input: activity });
+        results.push({ queueId, status: "synced", entryIds: result.entryIds });
+      } catch (error) {
+        results.push({ queueId, status: "conflict", message: error instanceof Error ? error.message : "Unable to synchronize this activity." });
       }
     }
-    return createActivityEntries({
-      userId: ctx.user.id,
-      studentIds: input.studentIds,
-      classId: input.classId,
-      subjectId: input.subjectId,
-      cycleId: input.cycleId,
-      action: input.action as ChallengeAction,
-      points: Number(rule?.points ?? actionDefaults[input.action as ChallengeAction]),
-      note: input.note,
-      idempotencyKey: input.idempotencyKey,
-      undoWindowSeconds: 8,
-    });
+    return { results };
   }),
   cancel: protectedProcedure.input(z.object({ entryId: z.number().int().positive(), reason: z.string().min(3).max(500) })).mutation(({ ctx, input }) => {
     requireStaff(ctx.user.role);

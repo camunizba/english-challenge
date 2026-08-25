@@ -15,3 +15,13 @@
 - [x] Preparar manifest e comportamento instalável de PWA, com sinalização de conectividade e estrutura para sincronização futura.
 - [x] Adicionar testes de regras de pontuação, teto de conversão, prevenção de duplicidade e preservação de trilha de auditoria.
 - [x] Validar a interface em desktop e mobile, executar testes automatizados e preparar o checkpoint de entrega.
+- [x] Implementar uma fila local segura de lançamentos pendentes com status, horário original, identificador idempotente e remoção após sincronização confirmada.
+- [x] Sincronizar automaticamente a fila de lançamentos quando a conexão retornar, registrar conflitos e evitar duplicações no servidor.
+- [x] Criar gestão operacional de usuários com papéis de liderança, professor e visualizador, incluindo alteração de papel e status.
+- [x] Criar gestão de turmas, disciplinas e vínculos de professores com autorização por turma e disciplina.
+- [x] Exibir indicadores de conectividade, pendências e conflitos no painel docente e uma área administrativa para usuários e vínculos.
+- [x] Adicionar testes de serialização de fila offline, idempotência, sincronização e validação de vínculo docente.
+- [x] Validar a interface e salvar um checkpoint da ampliação de sincronização e gestão escolar.
+- [x] Associar cada item offline ao usuário de origem e bloquear a sincronização por outra sessão.
+- [x] Limpar a fila local ao encerrar sessão e marcar conflitos quando houver troca de usuário no mesmo dispositivo.
+- [x] Expandir os testes de sincronização para cobrir autoria, conflito por usuário divergente e reenvio idempotente.

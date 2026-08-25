@@ -1,0 +1,1 @@
+ALTER TABLE `activityEntries` ADD `sourceDeviceId` varchar(96);

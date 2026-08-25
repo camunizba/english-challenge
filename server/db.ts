@@ -1,4 +1,5 @@
 import { and, desc, eq, gt } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   activityEntries,
@@ -12,6 +13,7 @@ import {
   importBatches,
   type ChallengeAction,
   type InsertUser,
+  schoolYears,
   scoringRules,
   students,
   subjects,
@@ -20,6 +22,7 @@ import {
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 import { buildCancellationEvents } from "./challengeRules";
+import { uniqueTeacherAssignments } from "./managementRules";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -141,10 +144,13 @@ export async function createActivityEntries(input: {
   note?: string;
   idempotencyKey: string;
   undoWindowSeconds: number;
+  recordedAt?: Date;
+  sourceDeviceId?: string;
 }) {
   const db = await getDb();
   if (!db) throw new Error("Database unavailable");
   const now = new Date();
+  const recordedAt = input.recordedAt ?? now;
   const undoExpiresAt = new Date(now.getTime() + input.undoWindowSeconds * 1000);
   const rows = input.studentIds.map(studentId => ({
     idempotencyKey: `${input.idempotencyKey}:${studentId}`,
@@ -155,9 +161,10 @@ export async function createActivityEntries(input: {
     action: input.action,
     points: input.points.toFixed(2),
     note: input.note || null,
-    recordedAt: now,
+    recordedAt,
     syncedAt: now,
     syncStatus: "synced" as const,
+    sourceDeviceId: input.sourceDeviceId ?? null,
     createdByUserId: input.userId,
     undoExpiresAt,
   }));
@@ -171,6 +178,12 @@ export async function createActivityEntries(input: {
   });
   const firstEntryId = Number(insertResult[0].insertId);
   return { created: rows.length, entryIds: rows.map((_, index) => firstEntryId + index), undoExpiresAt };
+}
+
+export async function getEntriesByBatchIdempotencyKey(idempotencyKey: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select({ id: activityEntries.id }).from(activityEntries).where(sql`${activityEntries.idempotencyKey} LIKE ${`${idempotencyKey}:%`}`);
 }
 
 export async function listReferenceData() {
@@ -315,4 +328,57 @@ export async function getMyStudentStatement(userId: number) {
   const student = (await db.select({ id: students.id }).from(students).where(eq(students.viewerUserId, userId)).limit(1))[0];
   if (!student) return null;
   return getStudentStatement({ studentId: student.id, userId, role: "viewer" });
+}
+
+export async function getManagementData() {
+  const db = await getDb();
+  if (!db) return { users: [], schoolYears: [], classes: [], subjects: [], assignments: [] };
+  const [userRows, schoolYearRows, classRows, subjectRows, assignmentRows] = await Promise.all([
+    db.select({ id: users.id, name: users.name, email: users.email, role: users.role, accessStatus: users.accessStatus, lastSignedIn: users.lastSignedIn }).from(users).orderBy(users.name),
+    db.select().from(schoolYears).orderBy(desc(schoolYears.startsAt)),
+    db.select().from(classes).orderBy(classes.name),
+    db.select().from(subjects).orderBy(subjects.name),
+    db.select({ id: teacherAssignments.id, userId: teacherAssignments.userId, classId: teacherAssignments.classId, className: classes.name, subjectId: teacherAssignments.subjectId, subjectName: subjects.name, active: teacherAssignments.active }).from(teacherAssignments).innerJoin(classes, eq(teacherAssignments.classId, classes.id)).innerJoin(subjects, eq(teacherAssignments.subjectId, subjects.id)),
+  ]);
+  return { users: userRows, schoolYears: schoolYearRows, classes: classRows, subjects: subjectRows, assignments: assignmentRows };
+}
+
+export async function updateManagedUser(input: { targetUserId: number; role: "viewer" | "teacher" | "leadership"; accessStatus: "active" | "suspended"; actorUserId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  await db.update(users).set({ role: input.role, accessStatus: input.accessStatus }).where(eq(users.id, input.targetUserId));
+  await db.insert(auditLogs).values({ actorUserId: input.actorUserId, eventType: "school_user_updated", resourceType: "user", resourceId: String(input.targetUserId), detail: `Role set to ${input.role}; access status set to ${input.accessStatus}.` });
+  return { success: true };
+}
+
+export async function setTeacherAssignments(input: { teacherUserId: number; assignments: Array<{ classId: number; subjectId: number }>; actorUserId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const teacher = (await db.select({ role: users.role }).from(users).where(eq(users.id, input.teacherUserId)).limit(1))[0];
+  if (!teacher || teacher.role !== "teacher") throw new Error("Assignments can only be created for an active teacher profile.");
+  const assignments = uniqueTeacherAssignments(input.assignments);
+  await db.update(teacherAssignments).set({ active: false }).where(eq(teacherAssignments.userId, input.teacherUserId));
+  for (const assignment of assignments) {
+    await db.insert(teacherAssignments).values({ userId: input.teacherUserId, classId: assignment.classId, subjectId: assignment.subjectId, active: true }).onDuplicateKeyUpdate({ set: { active: true } });
+  }
+  await db.insert(auditLogs).values({ actorUserId: input.actorUserId, eventType: "teacher_assignments_updated", resourceType: "user", resourceId: String(input.teacherUserId), detail: `${assignments.length} active class and subject assignment(s).` });
+  return { success: true, activeAssignments: assignments.length };
+}
+
+export async function createManagedClass(input: { schoolYearId: number; segment: string; grade: string; name: string; actorUserId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const result = await db.insert(classes).values({ schoolYearId: input.schoolYearId, segment: input.segment, grade: input.grade, name: input.name, active: true });
+  const classId = Number(result[0].insertId);
+  await db.insert(auditLogs).values({ actorUserId: input.actorUserId, eventType: "class_created", resourceType: "class", resourceId: String(classId), detail: `${input.name} created for ${input.grade}.` });
+  return { classId };
+}
+
+export async function createManagedSubject(input: { code: string; name: string; actorUserId: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const result = await db.insert(subjects).values({ code: input.code, name: input.name, active: true });
+  const subjectId = Number(result[0].insertId);
+  await db.insert(auditLogs).values({ actorUserId: input.actorUserId, eventType: "subject_created", resourceType: "subject", resourceId: String(subjectId), detail: `${input.code}: ${input.name}.` });
+  return { subjectId };
 }
