@@ -1,11 +1,28 @@
-import { eq } from "drizzle-orm";
+import { and, desc, eq, gt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users } from "../drizzle/schema";
-import { ENV } from './_core/env';
+import {
+  activityEntries,
+  activityActionValues,
+  appeals,
+  auditLogs,
+  championCycles,
+  classes,
+  entryRevisions,
+  gradeConversions,
+  importBatches,
+  type ChallengeAction,
+  type InsertUser,
+  scoringRules,
+  students,
+  subjects,
+  teacherAssignments,
+  users,
+} from "../drizzle/schema";
+import { ENV } from "./_core/env";
+import { buildCancellationEvents } from "./challengeRules";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
-// Lazily create the drizzle instance so local tooling can run without a DB.
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
@@ -19,74 +36,283 @@ export async function getDb() {
 }
 
 export async function upsertUser(user: InsertUser): Promise<void> {
-  if (!user.openId) {
-    throw new Error("User openId is required for upsert");
-  }
-
+  if (!user.openId) throw new Error("User openId is required for upsert");
   const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
-    return;
-  }
+  if (!db) return;
 
-  try {
-    const values: InsertUser = {
-      openId: user.openId,
-    };
-    const updateSet: Record<string, unknown> = {};
-
-    const textFields = ["name", "email", "loginMethod"] as const;
-    type TextField = (typeof textFields)[number];
-
-    const assignNullable = (field: TextField) => {
-      const value = user[field];
-      if (value === undefined) return;
-      const normalized = value ?? null;
-      values[field] = normalized;
-      updateSet[field] = normalized;
-    };
-
-    textFields.forEach(assignNullable);
-
-    if (user.lastSignedIn !== undefined) {
-      values.lastSignedIn = user.lastSignedIn;
-      updateSet.lastSignedIn = user.lastSignedIn;
+  const values: InsertUser = { openId: user.openId, lastSignedIn: new Date() };
+  const updateSet: Record<string, unknown> = { lastSignedIn: new Date() };
+  (["name", "email", "loginMethod"] as const).forEach(field => {
+    if (user[field] !== undefined) {
+      values[field] = user[field] ?? null;
+      updateSet[field] = user[field] ?? null;
     }
-    if (user.role !== undefined) {
-      values.role = user.role;
-      updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
-      values.role = 'admin';
-      updateSet.role = 'admin';
-    }
-
-    if (!values.lastSignedIn) {
-      values.lastSignedIn = new Date();
-    }
-
-    if (Object.keys(updateSet).length === 0) {
-      updateSet.lastSignedIn = new Date();
-    }
-
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
-      set: updateSet,
-    });
-  } catch (error) {
-    console.error("[Database] Failed to upsert user:", error);
-    throw error;
-  }
+  });
+  const role = user.role ?? (user.openId === ENV.ownerOpenId ? "leadership" : "viewer");
+  values.role = role;
+  updateSet.role = role;
+  await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
 }
 
 export async function getUserByOpenId(openId: string) {
   const db = await getDb();
-  if (!db) {
-    console.warn("[Database] Cannot get user: database not available");
-    return undefined;
-  }
-
+  if (!db) return undefined;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
-
-  return result.length > 0 ? result[0] : undefined;
+  return result[0];
 }
 
-// TODO: add feature queries here as your schema grows.
+export async function getChallengeSnapshot() {
+  const db = await getDb();
+  if (!db) return { connected: false, students: [], entries: [], cycles: [] };
+  const [studentRows, entryRows, cycleRows] = await Promise.all([
+    db.select().from(students).where(eq(students.status, "active")).limit(250),
+    db.select().from(activityEntries).orderBy(desc(activityEntries.recordedAt)).limit(40),
+    db.select().from(championCycles).orderBy(desc(championCycles.endsAt)).limit(8),
+  ]);
+  return { connected: true, students: studentRows, entries: entryRows, cycles: cycleRows };
+}
+
+export async function searchActiveStudents(query: string, classId?: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const conditions = [eq(students.status, "active")];
+  if (classId) conditions.push(eq(students.classId, classId));
+  const allStudents = await db.select().from(students).where(and(...conditions)).limit(250);
+  const normalizedQuery = query.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  if (!normalizedQuery) return allStudents.slice(0, 30);
+  return allStudents.filter(student => {
+    const searchable = `${student.firstName} ${student.lastName} ${student.enrollmentNumber}`
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    return normalizedQuery.split(/\s+/).every(part => searchable.includes(part));
+  }).slice(0, 30);
+}
+
+export async function teacherCanRecord(userId: number, classId: number, subjectId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  const assignment = await db.select({ id: teacherAssignments.id }).from(teacherAssignments).where(and(
+    eq(teacherAssignments.userId, userId),
+    eq(teacherAssignments.classId, classId),
+    eq(teacherAssignments.subjectId, subjectId),
+    eq(teacherAssignments.active, true),
+  )).limit(1);
+  return assignment.length > 0;
+}
+
+export async function findRecentDuplicate(input: {
+  userId: number;
+  studentId: number;
+  subjectId: number;
+  action: ChallengeAction;
+  cooldownSeconds: number;
+}) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const threshold = new Date(Date.now() - input.cooldownSeconds * 1000);
+  const entries = await db.select().from(activityEntries).where(and(
+    eq(activityEntries.createdByUserId, input.userId),
+    eq(activityEntries.studentId, input.studentId),
+    eq(activityEntries.subjectId, input.subjectId),
+    eq(activityEntries.action, input.action),
+    eq(activityEntries.status, "active"),
+    gt(activityEntries.recordedAt, threshold),
+  )).limit(1);
+  return entries[0];
+}
+
+export async function getCurrentRule(action: ChallengeAction) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rules = await db.select().from(scoringRules).where(and(
+    eq(scoringRules.action, action),
+    eq(scoringRules.status, "active"),
+  )).orderBy(desc(scoringRules.effectiveFrom)).limit(1);
+  return rules[0];
+}
+
+export async function createActivityEntries(input: {
+  userId: number;
+  studentIds: number[];
+  classId: number;
+  subjectId: number;
+  cycleId?: number;
+  action: ChallengeAction;
+  points: number;
+  note?: string;
+  idempotencyKey: string;
+  undoWindowSeconds: number;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const now = new Date();
+  const undoExpiresAt = new Date(now.getTime() + input.undoWindowSeconds * 1000);
+  const rows = input.studentIds.map(studentId => ({
+    idempotencyKey: `${input.idempotencyKey}:${studentId}`,
+    studentId,
+    classId: input.classId,
+    subjectId: input.subjectId,
+    cycleId: input.cycleId,
+    action: input.action,
+    points: input.points.toFixed(2),
+    note: input.note || null,
+    recordedAt: now,
+    syncedAt: now,
+    syncStatus: "synced" as const,
+    createdByUserId: input.userId,
+    undoExpiresAt,
+  }));
+  const insertResult = await db.insert(activityEntries).values(rows);
+  await db.insert(auditLogs).values({
+    actorUserId: input.userId,
+    eventType: "activity_entry_created",
+    resourceType: "activity_entry_batch",
+    resourceId: input.idempotencyKey,
+    detail: `${input.action} applied to ${input.studentIds.length} student(s).`,
+  });
+  const firstEntryId = Number(insertResult[0].insertId);
+  return { created: rows.length, entryIds: rows.map((_, index) => firstEntryId + index), undoExpiresAt };
+}
+
+export async function listReferenceData() {
+  const db = await getDb();
+  if (!db) return { classes: [], subjects: [], actions: activityActionValues };
+  const [classRows, subjectRows] = await Promise.all([
+    db.select().from(classes).where(eq(classes.active, true)).orderBy(classes.name),
+    db.select().from(subjects).where(eq(subjects.active, true)).orderBy(subjects.name),
+  ]);
+  return { classes: classRows, subjects: subjectRows, actions: activityActionValues };
+}
+
+export async function cancelActivityEntry(input: { entryId: number; actorUserId: number; reason: string; leadership: boolean }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const entry = (await db.select().from(activityEntries).where(eq(activityEntries.id, input.entryId)).limit(1))[0];
+  if (!entry) throw new Error("Activity entry not found");
+  if (entry.status !== "active") throw new Error("Only active entries can be cancelled");
+  if (!input.leadership && entry.createdByUserId !== input.actorUserId) throw new Error("Only the original teacher can cancel this entry");
+  const events = buildCancellationEvents({ entryId: input.entryId, previousPoints: entry.points, actorUserId: input.actorUserId, reason: input.reason });
+  await db.update(activityEntries).set({ status: "cancelled" }).where(eq(activityEntries.id, input.entryId));
+  await db.insert(entryRevisions).values(events.revision);
+  await db.insert(auditLogs).values(events.audit);
+  return { success: true, entryId: input.entryId };
+}
+
+export async function createEntryAppeal(input: { entryId: number; studentId: number; requesterUserId: number; reason: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const student = (await db.select({ viewerUserId: students.viewerUserId }).from(students).where(eq(students.id, input.studentId)).limit(1))[0];
+  if (!student || student.viewerUserId !== input.requesterUserId) throw new Error("A viewer may only appeal an entry from their own statement");
+  await db.insert(appeals).values({
+    entryId: input.entryId,
+    studentId: input.studentId,
+    requesterUserId: input.requesterUserId,
+    reason: input.reason,
+  });
+  await db.update(activityEntries).set({ status: "under_review" }).where(eq(activityEntries.id, input.entryId));
+  await db.insert(auditLogs).values({
+    actorUserId: input.requesterUserId,
+    eventType: "entry_appeal_created",
+    resourceType: "activity_entry",
+    resourceId: String(input.entryId),
+    detail: "Viewer requested a review.",
+  });
+  return { success: true };
+}
+
+export async function importStudents(input: { userId: number; classId: number; fileName: string; rows: Array<{ enrollmentNumber: string; firstName: string; lastName: string; publicName?: string; status: "active" | "inactive" }> }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const batchResult = await db.insert(importBatches).values({
+    fileName: input.fileName,
+    sourceType: "csv",
+    status: "validated",
+    totalRows: input.rows.length,
+    createdByUserId: input.userId,
+  });
+  for (const row of input.rows) {
+    await db.insert(students).values({
+      enrollmentNumber: row.enrollmentNumber,
+      firstName: row.firstName,
+      lastName: row.lastName,
+      publicName: row.publicName || null,
+      classId: input.classId,
+      status: row.status,
+    }).onDuplicateKeyUpdate({
+      set: { firstName: row.firstName, lastName: row.lastName, publicName: row.publicName || null, classId: input.classId, status: row.status },
+    });
+  }
+  const batchId = Number(batchResult[0].insertId);
+  await db.update(importBatches).set({ status: "imported", importedRows: input.rows.length }).where(eq(importBatches.id, batchId));
+  await db.insert(auditLogs).values({
+    actorUserId: input.userId,
+    eventType: "student_csv_imported",
+    resourceType: "import_batch",
+    resourceId: String(batchId),
+    detail: `${input.rows.length} student row(s) inserted or updated.`,
+  });
+  return { batchId, importedRows: input.rows.length };
+}
+
+export async function getConversionExport(classId?: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const conditions = classId ? [eq(students.classId, classId)] : [];
+  return db.select({
+    enrollmentNumber: students.enrollmentNumber,
+    studentName: students.firstName,
+    lastName: students.lastName,
+    className: classes.name,
+    subjectName: subjects.name,
+    rawPoints: gradeConversions.rawPoints,
+    configuredCeiling: gradeConversions.configuredCeiling,
+    convertedPoints: gradeConversions.convertedPoints,
+    administrativeAdjustment: gradeConversions.administrativeAdjustment,
+    approvedPoints: gradeConversions.approvedPoints,
+    status: gradeConversions.status,
+    approvedAt: gradeConversions.approvedAt,
+  }).from(gradeConversions)
+    .innerJoin(students, eq(gradeConversions.studentId, students.id))
+    .innerJoin(classes, eq(students.classId, classes.id))
+    .innerJoin(subjects, eq(gradeConversions.subjectId, subjects.id))
+    .where(conditions.length ? and(...conditions) : undefined);
+}
+
+export async function getStudentStatement(input: { studentId: number; userId: number; role: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const student = (await db.select().from(students).where(eq(students.id, input.studentId)).limit(1))[0];
+  if (!student) throw new Error("Student not found");
+  const isLeadership = input.role === "leadership" || input.role === "admin";
+  const isViewer = input.role === "viewer" || input.role === "user";
+  if (isViewer && student.viewerUserId !== input.userId) throw new Error("A viewer may only access their linked student statement");
+  if (!isViewer && !isLeadership) {
+    const assignment = await db.select({ id: teacherAssignments.id }).from(teacherAssignments).where(and(
+      eq(teacherAssignments.userId, input.userId),
+      eq(teacherAssignments.classId, student.classId ?? -1),
+      eq(teacherAssignments.active, true),
+    )).limit(1);
+    if (!assignment.length) throw new Error("Teacher is not assigned to this student's class");
+  }
+  const entries = await db.select({
+    id: activityEntries.id,
+    action: activityEntries.action,
+    points: activityEntries.points,
+    status: activityEntries.status,
+    recordedAt: activityEntries.recordedAt,
+    subjectName: subjects.name,
+    teacherName: users.name,
+  }).from(activityEntries)
+    .innerJoin(subjects, eq(activityEntries.subjectId, subjects.id))
+    .innerJoin(users, eq(activityEntries.createdByUserId, users.id))
+    .where(eq(activityEntries.studentId, student.id))
+    .orderBy(desc(activityEntries.recordedAt));
+  return { student, entries };
+}
+
+export async function getMyStudentStatement(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database unavailable");
+  const student = (await db.select({ id: students.id }).from(students).where(eq(students.viewerUserId, userId)).limit(1))[0];
+  if (!student) return null;
+  return getStudentStatement({ studentId: student.id, userId, role: "viewer" });
+}

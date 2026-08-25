@@ -1,0 +1,17 @@
+{
+  "name": "English Challenge",
+  "short_name": "English Challenge",
+  "description": "A supportive school recognition experience for everyday English use.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f8f5",
+  "theme_color": "#163e2e",
+  "icons": [
+    {
+      "src": "/manus-storage/english-challenge-app-icon_be6b9f6c.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
